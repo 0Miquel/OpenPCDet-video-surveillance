@@ -1,12 +1,15 @@
 import copy
 import pickle
 import os
-
+from pypcd import pypcd
 import numpy as np
 
-from ...ops.roiaware_pool3d import roiaware_pool3d_utils
-from ...utils import box_utils, common_utils
-from ..dataset import DatasetTemplate
+# from ...ops.roiaware_pool3d import roiaware_pool3d_utils
+# from ...utils import box_utils, common_utils
+# from ..dataset import DatasetTemplate
+from pcdet.ops.roiaware_pool3d import roiaware_pool3d_utils
+from pcdet.utils import box_utils, common_utils
+from pcdet.datasets.dataset import DatasetTemplate
 
 
 class CustomDataset(DatasetTemplate):
@@ -62,11 +65,38 @@ class CustomDataset(DatasetTemplate):
 
         return np.array(gt_boxes, dtype=np.float32), np.array(gt_names)
 
-    def get_lidar(self, idx):
-        lidar_file = self.root_path / 'points' / ('%s.npy' % idx)
+    def get_sweep(self, idx):
+        lidar_file = self.root_path / 'points' / ('%s.pcd' % idx)
         assert lidar_file.exists()
-        point_features = np.load(lidar_file)
-        return point_features
+        if lidar_file.suffix == '.pcd':
+            str_lidar_file = str(lidar_file)
+            pc = pypcd.PointCloud.from_path(str_lidar_file)
+            pc_data = pc.pc_data
+            points = np.array([pc_data["x"], pc_data["y"], pc_data["z"], pc_data["intensity"]], dtype=np.float32)
+            points = points.transpose(1, 0)
+        elif lidar_file.suffix == '.npy':
+            points = np.load(lidar_file)
+        else:
+            raise f'Extension {lidar_file.suffix} not supported when reading point cloud file.'
+        return points
+
+    def get_lidar_with_sweeps(self, info, max_sweeps=1):
+        idx = info['point_cloud']['lidar_idx']
+        points = self.get_sweep(idx)
+        sweep_points_list = [points]
+        sweep_times_list = [np.zeros((points.shape[0], 1))]
+
+        for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
+            points_sweep = self.get_sweep(info['sweeps'][k]['sweep_id'])
+            times_sweep = np.ones((points_sweep.shape[0], 1), dtype=np.float32) * info['sweeps'][k]['time_lag']
+            sweep_points_list.append(points_sweep)
+            sweep_times_list.append(times_sweep)
+
+        points = np.concatenate(sweep_points_list, axis=0)
+        times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
+
+        points = np.concatenate((points, times), axis=1)
+        return points
 
     def set_split(self, split):
         super().__init__(
@@ -89,8 +119,7 @@ class CustomDataset(DatasetTemplate):
             index = index % len(self.custom_infos)
 
         info = copy.deepcopy(self.custom_infos[index])
-        sample_idx = info['point_cloud']['lidar_idx']
-        points = self.get_lidar(sample_idx)
+        points = self.get_lidar_with_sweeps(info, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
         input_dict = {
             'frame_id': self.sample_id_list[index],
             'points': points
@@ -107,6 +136,10 @@ class CustomDataset(DatasetTemplate):
             })
 
         data_dict = self.prepare_data(data_dict=input_dict)
+
+        # data_dict.update({
+        #     'gt_labels': [self.class_names.index(label) for label in gt_names]
+        # })
 
         return data_dict
 
@@ -137,38 +170,53 @@ class CustomDataset(DatasetTemplate):
         else:
             raise NotImplementedError
 
-        return ap_result_str, ap_dict
+        benchmark_results = {}
+        for k, v in ap_dict.items():
+            metric = k.split("/")[0]
+            if f"test/{metric}" not in benchmark_results.keys():
+                benchmark_results[f"test/{metric}"] = v
 
-    def get_infos(self, class_names, num_workers=4, has_label=True, sample_id_list=None, num_features=4):
-        import concurrent.futures as futures
+        self.logger.info(ap_result_str)
 
-        def process_single_scene(sample_idx):
-            print('%s sample_idx: %s' % (self.split, sample_idx))
+        return benchmark_results, ap_dict
+
+    def get_infos_with_sweep(self, class_names, has_label=True, sample_id_list=None, num_features=4, max_sweeps=1):
+        sample_id_list = sample_id_list if sample_id_list is not None else self.sample_id_list
+
+        infos = []
+        for sample_idx, sample_id in enumerate(sample_id_list):
             info = {}
-            pc_info = {'num_features': num_features, 'lidar_idx': sample_idx}
+            pc_info = {'num_features': num_features, 'lidar_idx': sample_id}
             info['point_cloud'] = pc_info
 
             if has_label:
                 annotations = {}
-                gt_boxes_lidar, name = self.get_label(sample_idx)
+                gt_boxes_lidar, name = self.get_label(sample_id)
                 annotations['name'] = name
                 annotations['gt_boxes_lidar'] = gt_boxes_lidar[:, :7]
                 info['annos'] = annotations
 
-            return info
+            info['timestamp'] = float(sample_id)
+            info['sweeps'] = []
+            for sweep_idx in range(1, max_sweeps):
+                sweep_info = {}
+                sweep_idx_to_insert = sample_idx - sweep_idx
+                if sweep_idx_to_insert < 0:
+                    sweep_idx_to_insert = 0
+                sweep_id_to_insert = sample_id_list[sweep_idx_to_insert]
+                sweep_info['sweep_id'] = sweep_id_to_insert
+                sweep_info['time_lag'] = info['timestamp'] - float(sweep_id_to_insert)
+                info['sweeps'].append(sweep_info)
 
-        sample_id_list = sample_id_list if sample_id_list is not None else self.sample_id_list
+            infos.append(info)
 
-        # create a thread pool to improve the velocity
-        with futures.ThreadPoolExecutor(num_workers) as executor:
-            infos = executor.map(process_single_scene, sample_id_list)
-        return list(infos)
+        return infos
 
-    def create_groundtruth_database(self, info_path=None, used_classes=None, split='train'):
+    def create_groundtruth_database(self, info_path=None, used_classes=None, split='train', max_sweeps=1):
         import torch
 
-        database_save_path = Path(self.root_path) / ('gt_database' if split == 'train' else ('gt_database_%s' % split))
-        db_info_save_path = Path(self.root_path) / ('custom_dbinfos_%s.pkl' % split)
+        database_save_path = Path(self.root_path) / f'gt_database_{max_sweeps}sweeps'
+        db_info_save_path = Path(self.root_path) / f'custom_dbinfos_{max_sweeps}sweeps_{split}.pkl'
 
         database_save_path.mkdir(parents=True, exist_ok=True)
         all_db_infos = {}
@@ -180,7 +228,8 @@ class CustomDataset(DatasetTemplate):
             print('gt_database sample: %d/%d' % (k + 1, len(infos)))
             info = infos[k]
             sample_idx = info['point_cloud']['lidar_idx']
-            points = self.get_lidar(sample_idx)
+            # points = self.get_lidar(sample_idx)
+            points = self.get_lidar_with_sweeps(info, max_sweeps=max_sweeps)
             annos = info['annos']
             names = annos['name']
             gt_boxes = annos['gt_boxes_lidar']
@@ -230,7 +279,7 @@ class CustomDataset(DatasetTemplate):
                 f.write(line)
 
 
-def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=4):
+def create_custom_infos(dataset_cfg, class_names, data_path, save_path, max_sweeps=1):
     dataset = CustomDataset(
         dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path,
         training=False, logger=common_utils.create_logger()
@@ -238,22 +287,22 @@ def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=
     train_split, val_split = 'train', 'val'
     num_features = len(dataset_cfg.POINT_FEATURE_ENCODING.src_feature_list)
 
-    train_filename = save_path / ('custom_infos_%s.pkl' % train_split)
-    val_filename = save_path / ('custom_infos_%s.pkl' % val_split)
+    train_filename = save_path / f'custom_infos_{max_sweeps}sweeps_{train_split}.pkl'
+    val_filename = save_path / f'custom_infos_{max_sweeps}sweeps_{val_split}.pkl'
 
     print('------------------------Start to generate data infos------------------------')
 
     dataset.set_split(train_split)
-    custom_infos_train = dataset.get_infos(
-        class_names, num_workers=workers, has_label=True, num_features=num_features
+    custom_infos_train = dataset.get_infos_with_sweep(
+        class_names, has_label=True, num_features=num_features, max_sweeps=max_sweeps
     )
     with open(train_filename, 'wb') as f:
         pickle.dump(custom_infos_train, f)
     print('Custom info train file is saved to %s' % train_filename)
 
     dataset.set_split(val_split)
-    custom_infos_val = dataset.get_infos(
-        class_names, num_workers=workers, has_label=True, num_features=num_features
+    custom_infos_val = dataset.get_infos_with_sweep(
+        class_names, has_label=True, num_features=num_features, max_sweeps=max_sweeps
     )
     with open(val_filename, 'wb') as f:
         pickle.dump(custom_infos_val, f)
@@ -261,7 +310,7 @@ def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=
 
     print('------------------------Start create groundtruth database for data augmentation------------------------')
     dataset.set_split(train_split)
-    dataset.create_groundtruth_database(train_filename, split=train_split)
+    dataset.create_groundtruth_database(train_filename, split=train_split, max_sweeps=max_sweeps)
     print('------------------------Data preparation done------------------------')
 
 
@@ -274,10 +323,12 @@ if __name__ == '__main__':
         from easydict import EasyDict
 
         dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))
-        ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+        # dataset_cfg = EasyDict(yaml.safe_load(open("../../../tools/cfgs/dataset_configs/custom_dataset.yaml")))
+        ROOT_DIR = (Path(__file__).resolve().parent / '../../../../').resolve()
         create_custom_infos(
             dataset_cfg=dataset_cfg,
-            class_names=['Vehicle', 'Pedestrian', 'Cyclist'],
+            class_names=['pedestrian'],
             data_path=ROOT_DIR / 'data' / 'custom',
             save_path=ROOT_DIR / 'data' / 'custom',
+            max_sweeps=dataset_cfg.MAX_SWEEPS,
         )
