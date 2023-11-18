@@ -127,6 +127,23 @@ class DataBaseSampler(object):
 
         return db_infos
 
+    def filter_by_max_distance(self, db_infos, min_gt_distance_list):
+        for name_num in min_gt_distance_list:
+            name, max_num = name_num.split(':')
+            max_num = int(max_num)
+            if max_num > 0 and name in db_infos.keys():
+                filtered_infos = []
+                for info in db_infos[name]:
+                    if common_utils.get_box_distance(info['box3d_lidar']) <= max_num:
+                        filtered_infos.append(info)
+
+                if self.logger is not None:
+                    self.logger.info('Database filter by max distance %s: %d => %d' %
+                                     (name, len(db_infos[name]), len(filtered_infos)))
+                db_infos[name] = filtered_infos
+
+        return db_infos
+
     def sample_with_fixed_number(self, class_name, sample_group):
         """
         Args:
@@ -463,6 +480,7 @@ class DataBaseSampler(object):
                 num_gt = np.sum(class_name == gt_names)
                 sample_group['sample_num'] = str(int(self.sample_class_num[class_name]) - num_gt)
             if int(sample_group['sample_num']) > 0:
+                # SELECT THE NECESSARY RANDOM DETECTIONS TO ACCOMPLISH THE MINIMUM
                 sampled_dict = self.sample_with_fixed_number(class_name, sample_group)
 
                 sampled_boxes = np.stack([x['box3d_lidar'] for x in sampled_dict], axis=0).astype(np.float32)
@@ -491,6 +509,7 @@ class DataBaseSampler(object):
         sampled_gt_boxes = existed_boxes[gt_boxes.shape[0]:, :]
 
         if total_valid_sampled_dict.__len__() > 0:
+            # ADD THE DETECTIONS TO THE SCENE
             sampled_gt_boxes2d = np.concatenate(sampled_gt_boxes2d, axis=0) if len(sampled_gt_boxes2d) > 0 else None
             sampled_mv_height = np.concatenate(sampled_mv_height, axis=0) if len(sampled_mv_height) > 0 else None
 

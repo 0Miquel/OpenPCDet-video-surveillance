@@ -12,6 +12,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+def get_box_distance(box):
+    """
+    Compute the distance of the box to the sensor.
+    :param box: bounding box of detection, considering that the first three values are x,y,z
+    :return: the Euclidean distance to the sensor
+    """
+    x, y, z = box[:3]
+    distance = np.sqrt(x ** 2 + y ** 2 + z ** 2)
+    return distance
+
+
 def check_numpy_to_torch(x):
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x).float(), True
@@ -102,18 +113,19 @@ def get_voxel_centers(voxel_coords, downsample_times, voxel_size, point_cloud_ra
 
 def create_logger(log_file=None, rank=0, log_level=logging.INFO):
     logger = logging.getLogger(__name__)
-    logger.setLevel(log_level if rank == 0 else 'ERROR')
-    formatter = logging.Formatter('%(asctime)s  %(levelname)5s  %(message)s')
-    console = logging.StreamHandler()
-    console.setLevel(log_level if rank == 0 else 'ERROR')
-    console.setFormatter(formatter)
-    logger.addHandler(console)
-    if log_file is not None:
-        file_handler = logging.FileHandler(filename=log_file)
-        file_handler.setLevel(log_level if rank == 0 else 'ERROR')
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    logger.propagate = False
+    if not logger.handlers:
+        logger.setLevel(log_level if rank == 0 else 'ERROR')
+        formatter = logging.Formatter('%(asctime)s  %(levelname)5s  %(message)s')
+        console = logging.StreamHandler()
+        console.setLevel(log_level if rank == 0 else 'ERROR')
+        console.setFormatter(formatter)
+        logger.addHandler(console)
+        if log_file is not None:
+            file_handler = logging.FileHandler(filename=log_file)
+            file_handler.setLevel(log_level if rank == 0 else 'ERROR')
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        logger.propagate = False
     return logger
 
 

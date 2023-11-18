@@ -16,17 +16,26 @@ from pcdet.models import build_network, model_fn_decorator
 from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
+from sweep_utils.sweep_utils import update_cfg_sweep
+
+import wandb
 
 
-def parse_config():
+def parse_config(sweep_params):
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
+    # "cfgs/nuscenes_models/cbgs_second_multihead.yaml"
+    # "cfgs/custom_models/centerpoint.yaml"
+    # "cfgs/nuscenes_models/voxel_centerpoint_human_orientationless.yaml"
+    parser.add_argument('--use_wandb_to_log', action='store_true', default=False, help='save logs in wandb')
 
-    parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
-    parser.add_argument('--epochs', type=int, default=None, required=False, help='number of epochs to train for')
-    parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
+    parser.add_argument('--batch_size', type=int, default=1, required=False, help='batch size for training')
+    parser.add_argument('--epochs', type=int, default=1, required=False, help='number of epochs to train for')
+    parser.add_argument('--workers', type=int, default=2, help='number of workers for dataloader')
     parser.add_argument('--extra_tag', type=str, default='default', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
+    # "../checkpoints/pp_multihead_nds5823_updated.pth"
+    # "../checkpoints/cbgs_second_multihead_nds6229_updated.pth"
     parser.add_argument('--pretrained_model', type=str, default=None, help='pretrained_model')
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
@@ -34,29 +43,35 @@ def parse_config():
     parser.add_argument('--fix_random_seed', action='store_true', default=False, help='')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
-    parser.add_argument('--max_ckpt_save_num', type=int, default=30, help='max number of saved checkpoint')
+    parser.add_argument('--max_ckpt_save_num', type=int, default=3, help='max number of saved checkpoint')
     parser.add_argument('--merge_all_iters_to_one_epoch', action='store_true', default=False, help='')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                         help='set extra config keys if needed')
 
     parser.add_argument('--max_waiting_mins', type=int, default=0, help='max waiting minutes')
     parser.add_argument('--start_epoch', type=int, default=0, help='')
-    parser.add_argument('--num_epochs_to_eval', type=int, default=0, help='number of checkpoints to be evaluated')
+    parser.add_argument('--num_epochs_to_eval', type=int, default=1, help='number of checkpoints to be evaluated')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
-    
+
     parser.add_argument('--use_tqdm_to_record', action='store_true', default=False, help='if True, the intermediate losses will not be logged to file, only tqdm will be used')
     parser.add_argument('--logger_iter_interval', type=int, default=50, help='')
     parser.add_argument('--ckpt_save_time_interval', type=int, default=300, help='in terms of seconds')
     parser.add_argument('--wo_gpu_stat', action='store_true', help='')
     parser.add_argument('--use_amp', action='store_true', help='use mix precision training')
-    
+    parser.add_argument('--infer_time', action='store_true', default=True, help='calculate inference latency')
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+
+    if sweep_params is not None:
+        args.cfg_file = sweep_params["cfg_file"]
+        args.epochs = sweep_params["epochs"]
+        args.batch_size = sweep_params["batch_size"]
+        args.ckpt = sweep_params["ckpt"]
 
     cfg_from_yaml_file(args.cfg_file, cfg)
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])  # remove 'cfgs' and 'xxxx.yaml'
-    
+
     args.use_amp = args.use_amp or cfg.OPTIMIZATION.get('USE_AMP', False)
 
     if args.set_cfgs is not None:
@@ -65,8 +80,21 @@ def parse_config():
     return args, cfg
 
 
-def main():
-    args, cfg = parse_config()
+def main(sweep_params=None):
+    args, cfg = parse_config(sweep_params)
+
+    # WANDB LOG
+    args.use_wandb_to_log = True if sweep_params is not None else args.use_wandb_to_log
+    if args.use_wandb_to_log:
+        if sweep_params is None:
+            run = wandb.init(project="TFM", config=cfg)
+        else:
+            run = wandb.init()
+            update_cfg_sweep(cfg, run.config)
+        args.extra_tag = run.name
+    else:
+        args.extra_tag = args.extra_tag + "_" + datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
+
     if args.launcher == 'none':
         dist_train = False
         total_gpus = 1
@@ -83,6 +111,7 @@ def main():
         args.batch_size = args.batch_size // total_gpus
 
     args.epochs = cfg.OPTIMIZATION.NUM_EPOCHS if args.epochs is None else args.epochs
+    args.num_epochs_to_eval = args.epochs
 
     if args.fix_random_seed:
         common_utils.set_random_seed(666 + cfg.LOCAL_RANK)
@@ -104,7 +133,7 @@ def main():
         logger.info('Training in distributed mode : total_batch_size: %d' % (total_gpus * args.batch_size))
     else:
         logger.info('Training with a single process')
-        
+
     for key, val in vars(args).items():
         logger.info('{:16} {}'.format(key, val))
     log_config_to_file(cfg, logger=logger)
@@ -113,6 +142,7 @@ def main():
 
     tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
 
+    # CREATE DATALOADERS
     logger.info("----------- Create dataloader & network & optimizer -----------")
     train_set, train_loader, train_sampler = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
@@ -126,14 +156,16 @@ def main():
         seed=666 if args.fix_random_seed else None
     )
 
+    # CREATE MODEL
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
     if args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
+    # CREATE OPTIMIZER
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
-    # load checkpoint if it is possible
+    # LOAD CHECKPOINT IF POSSIBLE
     start_epoch = it = 0
     last_epoch = -1
     if args.pretrained_model is not None:
@@ -142,9 +174,13 @@ def main():
     if args.ckpt is not None:
         it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist_train, optimizer=optimizer, logger=logger)
         last_epoch = start_epoch + 1
+        it = 0 if it == -1 else it  # if it == -1 means that that epoch was finished and needs to start at 0 next
+        total_epochs = start_epoch + args.epochs
+        logger.info(f"Pretrained ckpt was trained for {start_epoch} epochs, it will be trained for {args.epochs} epochs more")
     else:
         ckpt_list = glob.glob(str(ckpt_dir / '*.pth'))
-              
+        total_epochs = args.epochs
+
         if len(ckpt_list) > 0:
             ckpt_list.sort(key=os.path.getmtime)
             while len(ckpt_list) > 0:
@@ -153,6 +189,8 @@ def main():
                         ckpt_list[-1], to_cpu=dist_train, optimizer=optimizer, logger=logger
                     )
                     last_epoch = start_epoch + 1
+                    it = 0 if it == -1 else it  # if it == -1 means that that epoch was finished and needs to start at 0 next
+                    total_epochs = start_epoch + args.epochs
                     break
                 except:
                     ckpt_list = ckpt_list[:-1]
@@ -163,6 +201,7 @@ def main():
     logger.info(f'----------- Model {cfg.MODEL.NAME} created, param count: {sum([m.numel() for m in model.parameters()])} -----------')
     logger.info(model)
 
+    # CREATE LR SCHEDULER
     lr_scheduler, lr_warmup_scheduler = build_scheduler(
         optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
         last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
@@ -180,7 +219,7 @@ def main():
         lr_scheduler=lr_scheduler,
         optim_cfg=cfg.OPTIMIZATION,
         start_epoch=start_epoch,
-        total_epochs=args.epochs,
+        total_epochs=total_epochs,
         start_iter=it,
         rank=cfg.LOCAL_RANK,
         tb_log=tb_log,
@@ -189,14 +228,15 @@ def main():
         lr_warmup_scheduler=lr_warmup_scheduler,
         ckpt_save_interval=args.ckpt_save_interval,
         max_ckpt_save_num=args.max_ckpt_save_num,
-        merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch, 
-        logger=logger, 
+        merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
+        logger=logger,
         logger_iter_interval=args.logger_iter_interval,
         ckpt_save_time_interval=args.ckpt_save_time_interval,
-        use_logger_to_record=not args.use_tqdm_to_record, 
+        use_logger_to_record=not args.use_tqdm_to_record,
         show_gpu_stat=not args.wo_gpu_stat,
         use_amp=args.use_amp,
-        cfg=cfg
+        cfg=cfg,
+        wandb_log=args.use_wandb_to_log
     )
 
     if hasattr(train_set, 'use_shared_memory') and train_set.use_shared_memory:
@@ -220,10 +260,12 @@ def main():
     repeat_eval_ckpt(
         model.module if dist_train else model,
         test_loader, args, eval_output_dir, logger, ckpt_dir,
-        dist_test=dist_train
+        dist_test=dist_train, wandb_log=args.use_wandb_to_log
     )
     logger.info('**********************End evaluation %s/%s(%s)**********************' %
                 (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
+    if args.use_wandb_to_log:
+        run.finish()
 
 
 if __name__ == '__main__':

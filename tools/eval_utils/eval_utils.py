@@ -8,6 +8,8 @@ import tqdm
 from pcdet.models import load_data_to_gpu
 from pcdet.utils import common_utils
 
+import wandb
+
 
 def statistics_info(cfg, ret_dict, metric, disp_dict):
     for cur_thresh in cfg.MODEL.POST_PROCESSING.RECALL_THRESH_LIST:
@@ -19,7 +21,7 @@ def statistics_info(cfg, ret_dict, metric, disp_dict):
         '(%d, %d) / %d' % (metric['recall_roi_%s' % str(min_thresh)], metric['recall_rcnn_%s' % str(min_thresh)], metric['gt_num'])
 
 
-def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=False, result_dir=None):
+def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=False, result_dir=None, wandb_log=False):
     result_dir.mkdir(parents=True, exist_ok=True)
 
     final_output_dir = result_dir / 'final_result' / 'data'
@@ -122,13 +124,19 @@ def eval_one_epoch(cfg, args, model, dataloader, epoch_id, logger, dist_test=Fal
     with open(result_dir / 'result.pkl', 'wb') as f:
         pickle.dump(det_annos, f)
 
-    result_str, result_dict = dataset.evaluation(
+    # THE FOLLOWING LINE EVALUATES THE DETECTIONS
+    benchmark_result, result_dict = dataset.evaluation(
         det_annos, class_names,
         eval_metric=cfg.MODEL.POST_PROCESSING.EVAL_METRIC,
-        output_path=final_output_dir
+        output_path=final_output_dir,
     )
 
-    logger.info(result_str)
+    if wandb_log:
+        benchmark_result["test/epoch"] = int(epoch_id)
+        benchmark_result["test/infer_time"] = float(disp_dict['infer_time'].split("(")[-1][:-1])
+        wandb.log(benchmark_result)
+
+    # logger.info(result_str)
     ret_dict.update(result_dict)
 
     logger.info('Result is saved to %s' % result_dir)

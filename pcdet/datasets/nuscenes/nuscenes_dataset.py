@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from ...ops.roiaware_pool3d import roiaware_pool3d_utils
-from ...utils import common_utils
-from ..dataset import DatasetTemplate
+from pcdet.ops.roiaware_pool3d import roiaware_pool3d_utils
+from pcdet.utils import common_utils
+from pcdet.datasets.dataset import DatasetTemplate
 from pyquaternion import Quaternion
 from PIL import Image
 
@@ -141,17 +141,17 @@ class NuScenesDataset(DatasetTemplate):
                 crop_h = newH - fH
                 crop_w = int(max(0, newW - fW) / 2)
                 crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
-            
+
             # reisze and crop image
             img = img.resize(resize_dims)
             img = img.crop(crop)
             crop_images.append(img)
             img_process_infos.append([resize, crop, False, 0])
-        
+
         input_dict['img_process_infos'] = img_process_infos
         input_dict['camera_imgs'] = crop_images
         return input_dict
-    
+
     def load_camera_info(self, input_dict, info):
         input_dict["image_paths"] = []
         input_dict["lidar2camera"] = []
@@ -166,7 +166,7 @@ class NuScenesDataset(DatasetTemplate):
             # lidar to camera transform
             lidar2camera_r = np.linalg.inv(camera_info["sensor2lidar_rotation"])
             lidar2camera_t = (
-                camera_info["sensor2lidar_translation"] @ lidar2camera_r.T
+                    camera_info["sensor2lidar_translation"] @ lidar2camera_r.T
             )
             lidar2camera_rt = np.eye(4).astype(np.float32)
             lidar2camera_rt[:3, :3] = lidar2camera_r.T
@@ -200,10 +200,10 @@ class NuScenesDataset(DatasetTemplate):
         images = []
         for name in filename:
             images.append(Image.open(str(self.root_path / name)))
-        
+
         input_dict["camera_imgs"] = images
         input_dict["ori_shape"] = images[0].size
-        
+
         # resize and crop image
         input_dict = self.crop_image(input_dict)
 
@@ -230,9 +230,17 @@ class NuScenesDataset(DatasetTemplate):
 
         if 'gt_boxes' in info:
             if self.dataset_cfg.get('FILTER_MIN_POINTS_IN_GT', False):
-                mask = (info['num_lidar_pts'] > self.dataset_cfg.FILTER_MIN_POINTS_IN_GT - 1)
+                mask_points = (info['num_lidar_pts'] >= self.dataset_cfg.FILTER_MIN_POINTS_IN_GT)
             else:
-                mask = None
+                mask_points = np.ones(len(info['num_lidar_pts']), dtype=bool)
+
+            if self.dataset_cfg.get('FILTER_MAX_DISTANCE_IN_GT', False):
+                info_distances = np.array([common_utils.get_box_distance(box) for box in info["gt_boxes"]])
+                mask_distance = (info_distances <= self.dataset_cfg.FILTER_MAX_DISTANCE_IN_GT)
+            else:
+                mask_distance = np.ones(len(info['num_lidar_pts']), dtype=bool)
+
+            mask = mask_points & mask_distance
 
             input_dict.update({
                 'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
@@ -248,9 +256,18 @@ class NuScenesDataset(DatasetTemplate):
             gt_boxes[np.isnan(gt_boxes)] = 0
             data_dict['gt_boxes'] = gt_boxes
 
+        # REMOVE INDEXES 7 AND 8 WHICH REFER TO VELOCITY IF NO VELOCITY ESTIMATION
         if not self.dataset_cfg.PRED_VELOCITY and 'gt_boxes' in data_dict:
             data_dict['gt_boxes'] = data_dict['gt_boxes'][:, [0, 1, 2, 3, 4, 5, 6, -1]]
-
+        # REPLACE ROTATION ANGLE BY 0 IF NO ROTATION ESTIMATION
+        if not self.dataset_cfg.get('PRED_ROTATION', True) and 'gt_boxes' in data_dict:
+            # data_dict['gt_boxes'] = data_dict['gt_boxes'][:, [0, 1, 2, 3, 4, 5, -1]]
+            data_dict['gt_boxes'][:, 6] = 0
+        # USE SAME VALUE FOR WIDHT AND LENGTH IF WE PREDICT CYLINDERS/SQUARED DETECTIONS
+        if self.dataset_cfg.get('SQUARE_DET', False) and 'gt_boxes' in data_dict:
+            max_dim = np.max(data_dict['gt_boxes'][:, 3:5], axis=1)
+            max_dim = np.repeat(max_dim, 2)
+            data_dict['gt_boxes'][:, 3:5] = max_dim.reshape(-1, 2)
         return data_dict
 
     def evaluation(self, det_annos, class_names, **kwargs):
@@ -293,21 +310,56 @@ class NuScenesDataset(DatasetTemplate):
             eval_version = 'cvpr_2019'
             eval_config = config_factory(eval_version)
 
-        nusc_eval = NuScenesEval(
-            nusc,
-            config=eval_config,
-            result_path=res_path,
-            eval_set=eval_set_map[self.dataset_cfg.VERSION],
-            output_dir=str(output_path),
-            verbose=True,
-        )
-        metrics_summary = nusc_eval.main(plot_examples=0, render_curves=False)
+        # MODIFY EVALUATION CONFIG FOR THE SPECIFIED MAX DISTANCE (RANGE)
+        benchmark_results = {}
+        for range_m in self.dataset_cfg.EVAL_RANGE:
+            self.logger.info(f'***************** RESULTS AT RANGE {range_m}m *****************')
+            eval_config.class_range = {
+                class_name: range_m
+                for class_name, class_range in eval_config.class_range.items()
+            }
 
-        with open(output_path / 'metrics_summary.json', 'r') as f:
-            metrics = json.load(f)
+            nusc_eval = NuScenesEval(
+                nusc,
+                config=eval_config,
+                result_path=res_path,
+                eval_set=eval_set_map[self.dataset_cfg.VERSION],
+                output_dir=str(output_path),
+                verbose=True,
+            )
+            # modify nusc_eval.gt_boxes and nusc_eval.pred_boxes here
+            nusc_eval = self.adapt_gt_and_pred(nusc_eval)
+            metrics_summary = nusc_eval.main(plot_examples=0, render_curves=False)
 
-        result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, self.class_names, version=eval_version)
-        return result_str, result_dict
+            with open(output_path / f'metrics_summary.json', 'r') as f:
+                metrics = json.load(f)
+
+            result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, self.class_names, version=eval_version)
+            self.logger.info(result_str)
+
+            for class_name in self.class_names:
+                benchmark_results[f'test/{class_name}_mAP@0-{range_m}m'] = metrics_summary["mean_dist_aps"][class_name]
+                for metric, value in metrics_summary["label_tp_errors"][class_name].items():
+                    benchmark_results[f'test/{class_name}_{metric}@0-{range_m}m'] = value
+
+        return benchmark_results, result_dict
+
+    def adapt_gt_and_pred(self, nusc_eval):
+        for boxes_token, boxes in nusc_eval.gt_boxes.boxes.items():
+            for box in boxes:
+                if not self.dataset_cfg.PRED_ROTATION:
+                    box.rotation = [1.0, 0.0, 0.0, 0.0]
+                if not self.dataset_cfg.PRED_VELOCITY:
+                    box.velocity = (0.0, 0.0)
+                if self.dataset_cfg.SQUARE_DET:
+                    max_dim = max(box.size[:2])
+                    box.size[0] = max_dim
+                    box.size[1] = max_dim
+        for boxes_token, boxes in nusc_eval.pred_boxes.boxes.items():
+            for box in boxes:
+                if not self.dataset_cfg.PRED_ROTATION:
+                    box.rotation = [1.0, 0.0, 0.0, 0.0]
+        return nusc_eval
 
     def create_groundtruth_database(self, used_classes=None, max_sweeps=10):
         import torch
@@ -357,7 +409,7 @@ class NuScenesDataset(DatasetTemplate):
 def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):
     from nuscenes.nuscenes import NuScenes
     from nuscenes.utils import splits
-    from . import nuscenes_utils
+    from pcdet.datasets.nuscenes import nuscenes_utils
     data_path = data_path / version
     save_path = save_path / version
 
@@ -408,15 +460,15 @@ if __name__ == '__main__':
     from easydict import EasyDict
 
     parser = argparse.ArgumentParser(description='arg parser')
-    parser.add_argument('--cfg_file', type=str, default=None, help='specify the config of dataset')
+    parser.add_argument('--cfg_file', type=str, default='../../../tools/cfgs/dataset_configs/nuscenes_dataset_mini.yaml', help='specify the config of dataset')
     parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
-    parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
+    parser.add_argument('--version', type=str, default='v1.0-mini', help='')
     parser.add_argument('--with_cam', action='store_true', default=False, help='use camera or not')
     args = parser.parse_args()
 
     if args.func == 'create_nuscenes_infos':
         dataset_cfg = EasyDict(yaml.safe_load(open(args.cfg_file)))
-        ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+        ROOT_DIR = (Path(__file__).resolve().parent / '../../../../').resolve()
         dataset_cfg.VERSION = args.version
         create_nuscenes_info(
             version=dataset_cfg.VERSION,

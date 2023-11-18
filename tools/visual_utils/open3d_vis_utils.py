@@ -8,11 +8,28 @@ import torch
 import matplotlib
 import numpy as np
 
+
 box_colormap = [
-    [1, 1, 1],
-    [0, 1, 0],
-    [0, 1, 1],
-    [1, 1, 0],
+    [0.0, 0.0, 1.0],     # blue
+    [0.0, 1.0, 0.0],     # green
+    [1.0, 0.0, 0.0],     # red
+    [1.0, 1.0, 0.0],     # yellow
+    [1.0, 0.0, 1.0],     # magenta
+    [0.0, 1.0, 1.0],     # cyan
+    [0.5, 0.5, 0.5],     # gray
+    [1.0, 0.5, 0.0],     # orange
+    [0.5, 0.0, 1.0],     # purple
+    [0.5, 1.0, 0.0],     # lime
+    [0.0, 0.5, 1.0],     # light blue
+    [1.0, 0.0, 0.5],     # pink
+    [0.0, 1.0, 0.5],     # spring green
+    [0.5, 0.0, 0.5],     # dark purple
+    [0.5, 0.5, 0.0],     # olive
+    [0.0, 0.5, 0.5],     # teal
+    [0.8, 0.8, 0.8],     # light gray
+    [0.5, 1.0, 0.5],     # light green
+    [0.5, 0.5, 1.0],     # light purple
+    [1.0, 0.5, 0.5]      # light pink
 ]
 
 
@@ -35,7 +52,7 @@ def get_coor_colors(obj_labels):
     return label_rgba
 
 
-def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_scores=None, point_colors=None, draw_origin=True):
+def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_scores=None, point_colors=None, draw_origin=True, gt_labels=None):
     if isinstance(points, torch.Tensor):
         points = points.cpu().numpy()
     if isinstance(gt_boxes, torch.Tensor):
@@ -64,7 +81,10 @@ def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_labels=None, ref_scor
         pts.colors = open3d.utility.Vector3dVector(point_colors)
 
     if gt_boxes is not None:
-        vis = draw_box(vis, gt_boxes, (0, 0, 1))
+        if gt_labels is not None:
+            vis = draw_box(vis, gt_boxes, (0, 0, 1), gt_labels)
+        else:
+            vis = draw_box(vis, gt_boxes, (0, 0, 1))
 
     if ref_boxes is not None:
         vis = draw_box(vis, ref_boxes, (0, 1, 0), ref_labels, ref_scores)
