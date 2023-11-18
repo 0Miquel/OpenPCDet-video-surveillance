@@ -1,6 +1,8 @@
 # Forked version of OpenPCDet for video surveillance
 Author: Miquel Romero Blanch ([Github](https://github.com/0Miquel))
 
+A video surveillance benchmark has been designed based on the nuScenes dataset.
+
 [//]: # (Additional requirements needed from the ones in `requirements.txt`:)
 
 [//]: # (+ numpy==1.23.0)
