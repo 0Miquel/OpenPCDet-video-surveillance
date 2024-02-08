@@ -3,6 +3,10 @@ Author: Miquel Romero Blanch ([Github](https://github.com/0Miquel))
 
 A video surveillance benchmark has been designed based on the nuScenes dataset.
 
+Code from the LiDAR-Assisted 3D Human Detection for Video Surveillance [paper](https://openaccess.thecvf.com/content/WACV2024W/RWS/papers/Blanch_LiDAR-Assisted_3D_Human_Detection_for_Video_Surveillance_WACVW_2024_paper.pdf). 
+
+Accepted at Real-World Surveillance: Applications and Challenges, 4th at WACV. Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision.
+
 [//]: # (Additional requirements needed from the ones in `requirements.txt`:)
 
 [//]: # (+ numpy==1.23.0)
